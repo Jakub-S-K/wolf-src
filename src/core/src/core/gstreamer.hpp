@@ -14,7 +14,7 @@ static void pipeline_error_handler(GstBus *bus, GstMessage *message, gpointer da
   GError *err;
   gchar *debug;
   gst_message_parse_error(message, &err, &debug);
-  logs::log(logs::error, "[GSTREAMER] Pipeline error: {}", err->message);
+  logs::log(logs::error, "[GSTREAMER] Pipeline error: {} ({})", err->message, debug ? debug : "");
   g_error_free(err);
   g_free(debug);
 
