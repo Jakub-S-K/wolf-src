@@ -1,5 +1,14 @@
 # games-on-whales/wolf
 
+> [!NOTE]
+> **AI fork with microphone support.** This is a fork of
+> [games-on-whales/wolf](https://github.com/games-on-whales/wolf) that adds microphone
+> passthrough using the Foundation Sunshine protocol — the client's microphone is exposed
+> as a virtual input device inside the game container. The changes are kept as a small,
+> rebase-friendly series of commits on the [`feat/microphone`](/commits/feat/microphone)
+> branch (see [`MAINTAINING.md`](MAINTAINING.md)). Upstream:
+> **https://github.com/games-on-whales/wolf**
+
 [![Linux build and test](https://github.com/games-on-whales/wolf/actions/workflows/linux-build-test.yml/badge.svg)](https://github.com/games-on-whales/wolf/actions/workflows/linux-build-test.yml)
 [![Discord](https://img.shields.io/discord/856434175455133727.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://discord.gg/kRGUDHNHt2)
 [![GitHub license](https://img.shields.io/github/license/games-on-whales/wolf)](https://github.com/games-on-whales/wolf/blob/main/LICENSE)
