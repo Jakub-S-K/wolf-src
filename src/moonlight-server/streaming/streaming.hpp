@@ -44,6 +44,29 @@ void start_audio_producer(const std::string &session_id,
                           const std::string &sink_name,
                           const std::string &server_name);
 
+/**
+ * Starts a microphone receiver for the given session.
+ *
+ * The Moonlight client sends the microphone as a Foundation Sunshine stream: a UDP socket
+ * (already bound in `socket_fd`) receives 12-byte-header packets whose payload is an Opus
+ * frame (header: flags u8, type u8 (=0x61), seq u16LE, timestamp u32LE ms, magic u32LE
+ * (=0x12345678)). We decode the Opus frames and play the resulting PCM into the session's
+ * virtual microphone (`device=sink_name` in PulseAudio), so that apps in the app container
+ * can record from it (exposed via PULSE_SOURCE=virtual_mic_<session>.monitor).
+ *
+ * When the session joins a lobby the receiver keeps playing into its own sink and a
+ * PulseAudio `module-loopback` bridges the audio into the lobby's virtual microphone
+ * (see `SwitchMicSinkEvent`). This keeps the GStreamer pipeline stable for the whole
+ * session.
+ */
+void start_mic_receiver(const std::string &session_id,
+                        const std::shared_ptr<int> &socket_fd,
+                        const std::string &sink_name,
+                        const std::string &server_name,
+                        const std::shared_ptr<audio::Server> &pulse_server,
+                        const std::shared_ptr<audio::VSink> &mic_sink,
+                        const std::shared_ptr<events::EventBusType> &event_bus);
+
 void start_streaming_video(immer::box<events::VideoSession> video_session,
                            const std::shared_ptr<events::EventBusType> &event_bus,
                            std::string client_ip,

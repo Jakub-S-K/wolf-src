@@ -1,17 +1,67 @@
 #pragma once
 
+#include <cerrno>
+#include <cstring>
 #include <events/events.hpp>
 #include <helpers/logger.hpp>
 #include <helpers/utils.hpp>
 #include <immer/vector.hpp>
+#include <memory>
+#include <netinet/in.h>
 #include <optional>
 #include <range/v3/view.hpp>
 #include <state/config.hpp>
 #include <state/serialised_config.hpp>
+#include <sys/socket.h>
+#include <unistd.h>
 
 namespace state {
 
 using namespace wolf::core;
+
+/**
+ * Opens a UDP socket bound to an ephemeral local port and returns it together with the
+ * assigned port. Used for the Foundation microphone extension: the client sends RTP/Opus
+ * to a port the server picks. We use a distinct port per session because all microphone
+ * packets may arrive from the same relay/client IP (e.g. moonlight-web-stream), so they
+ * cannot be demultiplexed by source address alone.
+ */
+inline std::shared_ptr<int> open_mic_socket(unsigned short &out_port) {
+  out_port = 0;
+  int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    logs::log(logs::warning, "[MIC] Unable to create microphone socket: {}", std::strerror(errno));
+    return nullptr;
+  }
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = 0;
+  if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+    logs::log(logs::warning, "[MIC] Unable to bind microphone socket: {}", std::strerror(errno));
+    ::close(fd);
+    return nullptr;
+  }
+
+  socklen_t addr_len = sizeof(addr);
+  if (::getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &addr_len) < 0) {
+    logs::log(logs::warning, "[MIC] Unable to read microphone socket port: {}", std::strerror(errno));
+    ::close(fd);
+    return nullptr;
+  }
+  out_port = ntohs(addr.sin_port);
+  logs::log(logs::debug, "[MIC] Microphone socket bound to port {}", out_port);
+
+  return std::shared_ptr<int>(new int(fd), [](int *p) {
+    if (p) {
+      if (*p >= 0) {
+        ::close(*p);
+      }
+      delete p;
+    }
+  });
+}
 
 inline std::optional<events::StreamSession> get_session_by_id(const immer::vector<events::StreamSession> &sessions,
                                                               const std::size_t id) {
@@ -93,6 +143,9 @@ inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<s
   std::uniform_int_distribution<> ints(0, 255);
   auto rtsp_fake_ip = fmt::format("{}.{}.{}.{}", ints(generator), ints(generator), ints(generator), ints(generator));
 
+  unsigned short mic_stream_port = 0;
+  auto mic_socket_fd = open_mic_socket(mic_stream_port);
+
   auto session = events::StreamSession{
       .display_mode = display_mode,
       .audio_channel_count = audio_channel_count,
@@ -115,7 +168,9 @@ inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<s
       .session_id = get_client_id(current_client),
       .video_stream_port = static_cast<unsigned short>(get_port(VIDEO_PING_PORT)),
       .audio_stream_port = static_cast<unsigned short>(get_port(AUDIO_PING_PORT)),
-      .control_stream_port = static_cast<unsigned short>(get_port(CONTROL_PORT))};
+      .control_stream_port = static_cast<unsigned short>(get_port(CONTROL_PORT)),
+      .mic_stream_port = mic_stream_port,
+      .mic_socket_fd = mic_socket_fd};
 
   return std::make_shared<events::StreamSession>(session);
 }

@@ -28,7 +28,13 @@ void start_runner(std::shared_ptr<events::Runner> runner,
   auto audio_server_on_host = std::filesystem::path(args->host->host_xdg_runtime_dir) /
                               std::filesystem::path(audio_server_name).filename();
   full_env.set("PULSE_SINK", pulse_sink_name);
-  full_env.set("PULSE_SOURCE", pulse_sink_name + ".monitor");
+  if (args->mic_sink) {
+    // Expose the client microphone as the default recording source so that in-game
+    // voice/proximity chat records from it instead of from the output monitor.
+    full_env.set("PULSE_SOURCE", fmt::format("{}{}.monitor", VIRTUAL_MIC_PREFIX, args->session_id));
+  } else {
+    full_env.set("PULSE_SOURCE", pulse_sink_name + ".monitor");
+  }
   full_env.set("PULSE_SERVER", audio_server_name);
   mounted_paths.push_back({audio_server_on_host, audio_server_name});
 
@@ -85,6 +91,11 @@ void start_runner(std::shared_ptr<events::Runner> runner,
     logs::log(logs::debug, "[STREAM_SESSION] Remove virtual audio sink");
     audio::delete_virtual_sink(args->audio_server->server, args->audio_sink);
   }
+
+  // NOTE: the virtual microphone sink is intentionally *not* deleted here. It is owned by the
+  // microphone receiver (see `streaming::start_mic_receiver`) and removed when the receiver
+  // actually stops. A pause/resume restarts the runner but keeps the receiver alive, so deleting
+  // the sink here would leave the receiver writing to a sink that no longer exists.
 }
 
 } // namespace wolf::core::sessions

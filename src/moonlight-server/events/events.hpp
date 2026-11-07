@@ -133,6 +133,12 @@ struct Lobby {
       std::make_shared<immer::atom<std::shared_ptr<audio::VSink>>>();
 
   /**
+   * The virtual microphone sink used by the lobby (fed by connected sessions' microphones)
+   */
+  std::shared_ptr<immer::atom<std::shared_ptr<audio::VSink>>> mic_sink =
+      std::make_shared<immer::atom<std::shared_ptr<audio::VSink>>>();
+
+  /**
    * A queue of devices that will be plugged into the runner when ready
    */
   std::shared_ptr<events::devices_atom_queue> plugged_devices_queue = std::make_shared<events::devices_atom_queue>();
@@ -312,6 +318,17 @@ struct SwitchStreamProducerEvents {
   std::string interpipe_src_id;
 };
 
+/**
+ * Redirect the microphone receiver of a session to a different virtual sink.
+ * Used by lobbies: while a session is in a lobby, its client microphone must be played
+ * into the lobby's virtual microphone (so the game running in the lobby can record it).
+ */
+struct SwitchMicSinkEvent {
+  std::size_t session_id;
+  /** Name of the PulseAudio sink the microphone should be played into (e.g. virtual_mic_<id>). */
+  std::string sink_name;
+};
+
 struct RTPVideoPingEvent {
   std::string client_ip;
   unsigned short client_port;
@@ -353,6 +370,7 @@ using EventBusHandlers = dp::handler_registration<immer::box<PlugDeviceEvent>,
                                                   immer::box<CreateLobbyEvent>,
                                                   immer::box<StopLobbyEvent>,
                                                   immer::box<SwitchStreamProducerEvents>,
+                                                  immer::box<SwitchMicSinkEvent>,
                                                   immer::box<DockerContainerCreated>,
                                                   immer::box<DockerContainerStopped>>;
 using EventBusType = dp::event_bus<immer::box<PlugDeviceEvent>,
@@ -374,6 +392,7 @@ using EventBusType = dp::event_bus<immer::box<PlugDeviceEvent>,
                                    immer::box<CreateLobbyEvent>,
                                    immer::box<StopLobbyEvent>,
                                    immer::box<SwitchStreamProducerEvents>,
+                                   immer::box<SwitchMicSinkEvent>,
                                    immer::box<DockerContainerCreated>,
                                    immer::box<DockerContainerStopped>>;
 using EventsVariant = std::variant<immer::box<PlugDeviceEvent>,
@@ -395,6 +414,7 @@ using EventsVariant = std::variant<immer::box<PlugDeviceEvent>,
                                    immer::box<CreateLobbyEvent>,
                                    immer::box<StopLobbyEvent>,
                                    immer::box<SwitchStreamProducerEvents>,
+                                   immer::box<SwitchMicSinkEvent>,
                                    immer::box<DockerContainerCreated>,
                                    immer::box<DockerContainerStopped>>;
 
@@ -432,10 +452,27 @@ struct StreamSession {
   // client info
   std::size_t session_id;
   std::string ip;
+  /**
+   * The Moonlight client `uniqueid` (the web UI user's `client_unique_id`). Used to give the
+   * virtual microphone a user-visible name so multiple concurrent sessions can be told apart.
+   */
+  std::string client_unique_id;
 
   unsigned short video_stream_port;
   unsigned short audio_stream_port;
   unsigned short control_stream_port;
+
+  /**
+   * UDP port where the Moonlight client sends the microphone (Foundation Sunshine extension).
+   * 0 when microphone support is disabled. The socket is bound at session creation time
+   * (`mic_socket_fd`) so that the RTSP SETUP can hand out the port immediately.
+   */
+  unsigned short mic_stream_port = 0;
+  /**
+   * Owned, bound UDP socket used to receive the microphone stream. Shared ownership
+   * so it is closed once the last copy of the session goes away.
+   */
+  std::shared_ptr<int> mic_socket_fd;
 
   /**
    * Optional: the wayland display for the current session.
@@ -445,6 +482,14 @@ struct StreamSession {
       std::make_shared<immer::atom<virtual_display::wl_state_ptr>>();
 
   std::shared_ptr<immer::atom<std::shared_ptr<audio::VSink>>> audio_sink =
+      std::make_shared<immer::atom<std::shared_ptr<audio::VSink>>>();
+
+  /**
+   * Optional: virtual microphone sink for the current session. The
+   * `virtual_mic_<session>.monitor` source is exposed to the app container (PULSE_SOURCE)
+   * and fed with the client microphone audio.
+   */
+  std::shared_ptr<immer::atom<std::shared_ptr<audio::VSink>>> mic_sink =
       std::make_shared<immer::atom<std::shared_ptr<audio::VSink>>>();
 
   // virtual devices

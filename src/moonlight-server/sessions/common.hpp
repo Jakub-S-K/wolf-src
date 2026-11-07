@@ -15,6 +15,7 @@
 namespace wolf::core::sessions {
 
 constexpr std::string_view VIRTUAL_SINK_PREFIX = "virtual_sink_";
+constexpr std::string_view VIRTUAL_MIC_PREFIX = "virtual_mic_";
 constexpr std::chrono::milliseconds DEFAULT_WAYLAND_SOCKET_WAIT_TIMEOUT = std::chrono::seconds(5);
 
 inline std::chrono::milliseconds get_wayland_socket_wait_timeout() {

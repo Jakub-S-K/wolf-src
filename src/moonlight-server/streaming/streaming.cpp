@@ -1,8 +1,10 @@
 #include "platforms/hw.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <control/control.hpp>
 #include <core/batched_send.hpp>
+#include <cstring>
 #include <gst-video-context.hpp>
 #include <gstreamer-1.0/gst/app/gstappsink.h>
 #include <gstreamer-1.0/gst/app/gstappsrc.h>
@@ -10,7 +12,9 @@
 #include <immer/array.hpp>
 #include <immer/box.hpp>
 #include <memory>
+#include <mutex>
 #include <streaming/streaming.hpp>
+#include <sys/socket.h>
 #include <thread>
 
 namespace streaming {
@@ -195,6 +199,215 @@ void start_audio_producer(const std::string &session_id,
 
     return immer::array<immer::box<events::EventBusHandlers>>{std::move(stop_handler), std::move(stop_lobby_handler)};
   });
+}
+
+namespace {
+// Foundation Sunshine microphone packet header (little endian):
+//   byte 0      flags
+//   byte 1      packet_type (0x61 = Opus)
+//   bytes 2..3  sequence number
+//   bytes 4..7  timestamp (ms)
+//   bytes 8..11 ssrc / magic (0x12345678)
+constexpr std::size_t MIC_HEADER_SIZE = 12;
+constexpr uint8_t MIC_PACKET_TYPE_OPUS = 0x61;
+constexpr uint32_t MIC_MAGIC = 0x12345678;
+
+uint32_t read_u32_le(const uint8_t *p) {
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+         (static_cast<uint32_t>(p[3]) << 24);
+}
+
+/**
+ * Shared, mutex-guarded handle to the currently active lobby loopback of a microphone
+ * receiver. Stop and switch handlers can be invoked from different threads, so access
+ * has to be serialised.
+ */
+struct MicLoopbackState {
+  std::mutex mutex;
+  std::shared_ptr<audio::VLoopback> loopback;
+};
+} // namespace
+
+void start_mic_receiver(const std::string &session_id,
+                        const std::shared_ptr<int> &socket_fd,
+                        const std::string &sink_name,
+                        const std::string &server_name,
+                        const std::shared_ptr<audio::Server> &pulse_server,
+                        const std::shared_ptr<audio::VSink> &mic_sink,
+                        const std::shared_ptr<events::EventBusType> &event_bus) {
+  if (!socket_fd || *socket_fd < 0) {
+    logs::log(logs::debug, "[MIC] No microphone socket for session {}, skipping mic receiver", session_id);
+    return;
+  }
+
+  auto pipeline_desc = fmt::format(
+      "appsrc name=mic_src is-live=true format=time do-timestamp=true block=false "
+      "caps=audio/x-opus,channels=1,rate=48000 ! "
+      "queue leaky=downstream max-size-buffers=3 ! "
+      "opusparse ! opusdec ! audioconvert ! audioresample ! "
+      "audio/x-raw,format=S16LE,layout=interleaved,channels=2,rate=48000 ! "
+      "pulsesink name=mic_pulse_sink device=\"{sink_name}\" server=\"{server_name}\" sync=true",
+      fmt::arg("sink_name", sink_name),
+      fmt::arg("server_name", server_name));
+  logs::log(logs::debug, "[MIC] Starting microphone receiver for {}: {}", session_id, pipeline_desc);
+
+  auto stop = std::make_shared<std::atomic_bool>(false);
+  auto appsrc_promise = std::make_shared<boost::promise<GstElement *>>();
+  auto appsrc_future = appsrc_promise->get_future();
+
+  // Reader thread: pull microphone packets off the UDP socket and push the Opus
+  // payload into the pipeline. Waits until the pipeline (and its appsrc) is ready.
+  std::thread([socket_fd, session_id, stop, appsrc_future = std::move(appsrc_future)]() mutable {
+    GstElement *appsrc = appsrc_future.get();
+    if (!appsrc) {
+      logs::log(logs::error, "[MIC] Microphone pipeline failed to expose appsrc for session {}", session_id);
+      return;
+    }
+
+    // Wake up periodically so we can notice stop requests.
+    timeval timeout{.tv_sec = 0, .tv_usec = 500000};
+    ::setsockopt(*socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    std::vector<uint8_t> buffer(65536);
+    std::size_t opus_packets = 0;
+    while (!stop->load()) {
+      auto received = ::recv(*socket_fd, buffer.data(), buffer.size(), 0);
+      if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+          continue;
+        }
+        logs::log(logs::warning, "[MIC] recv failed for session {}: {}", session_id, std::strerror(errno));
+        break;
+      }
+      if (received < static_cast<ssize_t>(MIC_HEADER_SIZE)) {
+        continue;
+      }
+
+      uint8_t packet_type = buffer[1];
+      uint32_t magic = read_u32_le(buffer.data() + 8);
+      if (packet_type != MIC_PACKET_TYPE_OPUS || magic != MIC_MAGIC) {
+        logs::log(logs::trace, "[MIC] Ignoring unexpected mic packet type={} magic={:x}", packet_type, magic);
+        continue;
+      }
+
+      auto payload_size = static_cast<gsize>(received) - MIC_HEADER_SIZE;
+      if (payload_size == 0) {
+        continue;
+      }
+
+      if (opus_packets == 0 || (opus_packets + 1) % 500 == 0) {
+        logs::log(logs::debug, "[MIC] Received microphone packet {} for session {} ({} bytes)",
+                  opus_packets + 1,
+                  session_id,
+                  payload_size);
+      }
+      ++opus_packets;
+
+      GstBuffer *gst_buffer = gst_buffer_new_allocate(nullptr, payload_size, nullptr);
+      gst_buffer_fill(gst_buffer, 0, buffer.data() + MIC_HEADER_SIZE, payload_size);
+      auto push_result = gst_app_src_push_buffer(GST_APP_SRC(appsrc), gst_buffer);
+      if (push_result != GST_FLOW_OK) {
+        logs::log(logs::warning, "[MIC] appsrc push failed for session {}: {}", session_id, static_cast<int>(push_result));
+      }
+    }
+
+    gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
+    gst_object_unref(appsrc);
+    logs::log(logs::debug, "[MIC] Microphone reader stopped for session {} (received {} packets)",
+              session_id,
+              opus_packets);
+  }).detach();
+
+  // Pipeline thread: owns the GStreamer pipeline (blocks until EOS/shutdown).
+  std::thread([pipeline_desc, session_id, sink_name, stop, appsrc_promise, pulse_server, mic_sink, event_bus]() {
+    auto loopback_state = std::make_shared<MicLoopbackState>();
+
+    run_pipeline(pipeline_desc, [session_id,
+                                 sink_name,
+                                 stop,
+                                 appsrc_promise,
+                                 pulse_server,
+                                 mic_sink,
+                                 event_bus,
+                                 loopback_state](auto pipeline) {
+      if (auto appsrc = gst_bin_get_by_name(GST_BIN(pipeline.get()), "mic_src")) {
+        appsrc_promise->set_value(appsrc); // reference ownership moves to the reader thread
+      } else {
+        logs::log(logs::error, "[MIC] Unable to find appsrc in microphone pipeline for session {}", session_id);
+        appsrc_promise->set_value(nullptr);
+      }
+
+      // Make the virtual microphone the server default recording source as well: `PULSE_SOURCE`
+      // is only honoured by some clients, others (e.g. Steam) record from the default source.
+      if (pulse_server) {
+        audio::set_default_source(pulse_server, fmt::format("{}.monitor", sink_name));
+      }
+
+      auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
+          [session_id, pipeline, stop, pulse_server, mic_sink, loopback_state](
+              const immer::box<events::StopStreamEvent> &ev) {
+            if (std::to_string(ev->session_id) == session_id) {
+              logs::log(logs::debug, "[MIC] Stopping microphone receiver: {}", session_id);
+              {
+                std::lock_guard<std::mutex> lock(loopback_state->mutex);
+                if (loopback_state->loopback) {
+                  audio::delete_loopback(pulse_server, loopback_state->loopback);
+                  loopback_state->loopback.reset();
+                }
+              }
+              // The virtual microphone sink is owned by the receiver (and not by the app runner):
+              // a pause/resume stops the runner, and deleting the sink there would leave the receiver
+              // playing into a device that no longer exists until the next session recreation.
+              if (pulse_server && mic_sink) {
+                audio::delete_virtual_sink(pulse_server, mic_sink);
+              }
+              stop->store(true);
+              gst_element_send_event(pipeline.get(), gst_event_new_eos());
+            }
+          });
+
+      // Lobbies bridge this session's microphone into the lobby's virtual microphone using a
+      // PulseAudio loopback. The receiver keeps playing into `sink_name` for the whole
+      // session: reconfiguring the `device` of a live pulsesink breaks negotiation
+      // ("Sink not negotiated before eos event"), so we never touch the pipeline here.
+      auto switch_mic_handler = event_bus->register_handler<immer::box<events::SwitchMicSinkEvent>>(
+          [session_id, sink_name, pulse_server, loopback_state](const immer::box<events::SwitchMicSinkEvent> &ev) {
+            if (std::to_string(ev->session_id) != session_id) {
+              return;
+            }
+
+            std::lock_guard<std::mutex> lock(loopback_state->mutex);
+            if (loopback_state->loopback) {
+              audio::delete_loopback(pulse_server, loopback_state->loopback);
+              loopback_state->loopback.reset();
+            }
+
+            if (ev->sink_name == sink_name) {
+              logs::log(logs::debug, "[MIC] Microphone for {} restored to session sink {}", session_id, sink_name);
+              if (pulse_server) {
+                audio::set_default_source(pulse_server, fmt::format("{}.monitor", sink_name));
+              }
+              return;
+            }
+            if (!pulse_server) {
+              logs::log(logs::warning,
+                        "[MIC] No PulseAudio server, cannot bridge microphone for {} into {}",
+                        session_id,
+                        ev->sink_name);
+              return;
+            }
+
+            auto source = fmt::format("{}.monitor", sink_name);
+            logs::log(
+                logs::debug, "[MIC] Bridging microphone for {} from {} to {}", session_id, source, ev->sink_name);
+            audio::set_default_source(pulse_server, fmt::format("{}.monitor", ev->sink_name));
+            loopback_state->loopback = audio::create_loopback(pulse_server, source, ev->sink_name);
+          });
+
+      return immer::array<immer::box<events::EventBusHandlers>>{std::move(stop_handler),
+                                                                std::move(switch_mic_handler)};
+    });
+  }).detach();
 }
 
 namespace custom_sink {

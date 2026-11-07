@@ -127,6 +127,13 @@ RTSP_PACKET setup(const RTSP_PACKET &req, const events::StreamSession &session) 
     options["X-SS-Ping-Payload"] = {session.rtp_secret_payload.begin(), session.rtp_secret_payload.end()};
     break;
   }
+  case utils::hash("mic"): {
+    // Foundation Sunshine microphone extension. Unlike audio/video, this stream flows
+    // client -> host, so `server_port` is the port the client must send its RTP/Opus to.
+    options["Transport"] = "server_port=" + std::to_string(session.mic_stream_port);
+    options["X-SS-Ping-Payload"] = {session.rtp_secret_payload.begin(), session.rtp_secret_payload.end()};
+    break;
+  }
   case utils::hash("control"): {
     options["Transport"] = "server_port=" + std::to_string(session.control_stream_port);
     options["X-SS-Connect-Data"] = std::to_string(session.enet_secret_payload);

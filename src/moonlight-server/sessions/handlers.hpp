@@ -34,6 +34,11 @@ struct RunnerArgs {
 
   const std::optional<AudioServer> &audio_server;
   const std::shared_ptr<audio::VSink> audio_sink;
+  /**
+   * Optional virtual microphone sink (`virtual_mic_<session>`). When set, the app container
+   * gets `PULSE_SOURCE=virtual_mic_<session>.monitor` and client mic audio is played into it.
+   */
+  const std::shared_ptr<audio::VSink> mic_sink = nullptr;
 
   const immer::box<state::Host> host;
   const std::string &app_local_state_folder;

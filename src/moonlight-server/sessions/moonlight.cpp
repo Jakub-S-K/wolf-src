@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <immer/array_transient.hpp>
 #include <immer/map_transient.hpp>
@@ -5,6 +6,7 @@
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
 #include <state/sessions.hpp>
+#include <string>
 #include <streaming/streaming.hpp>
 
 namespace wolf::core::sessions {
@@ -160,6 +162,37 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           }).detach();
         }
 
+        /* Create virtual microphone sink (Foundation mic extension) and its receiver */
+        if (audio_server && audio_server->server && session->mic_socket_fd) {
+          logs::log(logs::debug, "[STREAM_SESSION] Create virtual microphone sink");
+          auto mic_sink_name = fmt::format("{}{}", VIRTUAL_MIC_PREFIX, session->session_id);
+          // Give the microphone a short, user-visible name (no spaces allowed: it is a PulseAudio
+          // module argument). Games truncate long device names, so keep it to just the user name:
+          // each session's microphone shows up as "Monitor of <user>".
+          auto mic_description = std::string{"WolfMicrophone"};
+          if (!session->client_unique_id.empty()) {
+            mic_description = session->client_unique_id;
+            std::replace(mic_description.begin(), mic_description.end(), ' ', '_');
+          }
+          auto mic_device = audio::create_virtual_sink(
+              audio_server->server,
+              audio::AudioDevice{.sink_name = mic_sink_name,
+                                 .mode = state::get_audio_mode(2, true),
+                                 .description = mic_description});
+          session->mic_sink->store(mic_device);
+
+          std::thread([session, audio_server = audio_server->server]() {
+            auto mic_sink_name = fmt::format("{}{}", VIRTUAL_MIC_PREFIX, session->session_id);
+            streaming::start_mic_receiver(std::to_string(session->session_id),
+                                          session->mic_socket_fd,
+                                          mic_sink_name,
+                                          audio::get_server_name(audio_server),
+                                          audio_server,
+                                          session->mic_sink->load(),
+                                          session->event_bus);
+          }).detach();
+        }
+
         // TODO: timeout? What if the wayland display is never ready?
         auto w_display_ready = on_ready->get_future().then([session, runtime_dir](auto fut) {
           streaming::WaylandDisplayReady ready = fut.get();
@@ -218,6 +251,7 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                   .wayland_display = run_session->stream_session->wayland_display->load(),
                   .audio_server = audio_server,
                   .audio_sink = run_session->stream_session->audio_sink->load(),
+                  .mic_sink = run_session->stream_session->mic_sink->load(),
                   .host = app_state->host,
                   .app_local_state_folder = run_session->stream_session->app_local_state_folder,
                   .app_host_state_folder = run_session->stream_session->app_host_state_folder,
