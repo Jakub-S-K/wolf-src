@@ -47,11 +47,22 @@ struct AudioMode {
 struct AudioDevice {
   std::string_view sink_name;
   AudioMode mode;
+  /** Human readable description shown in PulseAudio UIs (optional). */
+  std::string_view description{};
 };
 
 struct VSink {
   AudioDevice device;
   boost::promise<unsigned int> sink_idx;
+};
+
+/**
+ * A loaded PulseAudio `module-loopback`. Used to bridge one virtual microphone
+ * (source, usually `<sink>.monitor`) into another virtual microphone (sink)
+ * without touching the GStreamer pipeline that feeds the source.
+ */
+struct VLoopback {
+  boost::promise<unsigned int> module_idx;
 };
 
 /**
@@ -64,6 +75,28 @@ void queue_op(const std::shared_ptr<Server> &server, const std::function<void()>
 std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server, const AudioDevice &device);
 
 void delete_virtual_sink(const std::shared_ptr<Server> &server, const std::shared_ptr<VSink> &vsink);
+
+/**
+ * Loads a PulseAudio `module-loopback` forwarding audio from `source_name` to `sink_name`.
+ *
+ * This is used to feed a lobby's virtual microphone from a session's virtual microphone
+ * while keeping the microphone receiver's GStreamer pipeline (and its `pulsesink`)
+ * pinned to the session sink for the whole session: changing the `device` property of a
+ * live `pulsesink` breaks negotiation ("Sink not negotiated before eos event").
+ */
+std::shared_ptr<VLoopback> create_loopback(const std::shared_ptr<Server> &server,
+                                           std::string_view source_name,
+                                           std::string_view sink_name);
+
+void delete_loopback(const std::shared_ptr<Server> &server, const std::shared_ptr<VLoopback> &vloopback);
+
+/**
+ * Sets the server-wide default recording source (e.g. `virtual_mic_<id>.monitor`).
+ *
+ * `PULSE_SOURCE` only affects clients that honour it; some applications (notably Steam) record
+ * from the server default source instead, so the virtual microphone must also be selected here.
+ */
+void set_default_source(const std::shared_ptr<Server> &server, std::string_view source_name);
 
 void disconnect(const std::shared_ptr<Server> &server);
 

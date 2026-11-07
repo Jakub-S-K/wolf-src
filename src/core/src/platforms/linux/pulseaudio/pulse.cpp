@@ -159,6 +159,9 @@ std::shared_ptr<VSink> create_virtual_sink(const std::shared_ptr<Server> &server
                                     device.sink_name,
                                     device.mode.channels,
                                     fmt::join(device.mode.speakers, ","));
+    if (!device.description.empty()) {
+      channel_spec += fmt::format(" sink_properties=device.description={}", device.description);
+    }
     auto operation = pa_context_load_module(
         server->ctx,
         "module-null-sink",
@@ -191,6 +194,57 @@ void delete_virtual_sink(const std::shared_ptr<Server> &server, const std::share
     auto status = result->get_future().get(); // wait for it to complete
     logs::log(logs::debug, "[PULSE] Removed virtual sink, status: {}", status);
     pa_operation_unref(operation);
+  });
+}
+
+std::shared_ptr<VLoopback> create_loopback(const std::shared_ptr<Server> &server,
+                                           std::string_view source_name,
+                                           std::string_view sink_name) {
+  auto loopback = std::make_shared<VLoopback>();
+
+  queue_op(server, [server, loopback, source = std::string(source_name), sink = std::string(sink_name)]() {
+    auto args = fmt::format("source={} sink={} latency_msec=5", source, sink);
+    logs::log(logs::debug, "[PULSE] Creating loopback: {}", args);
+    auto operation = pa_context_load_module(
+        server->ctx,
+        "module-loopback",
+        args.c_str(),
+        [](pa_context *c, uint32_t idx, void *data) {
+          auto result = (VLoopback *)data;
+          logs::log(logs::debug, "[PULSE] Created loopback module: {}", idx);
+          result->module_idx.set_value(idx);
+        },
+        loopback.get());
+    pa_operation_unref(operation);
+  });
+
+  return loopback;
+}
+
+void delete_loopback(const std::shared_ptr<Server> &server, const std::shared_ptr<VLoopback> &vloopback) {
+  if (!vloopback) {
+    return;
+  }
+
+  queue_op(server, [server, vloopback]() {
+    auto operation = pa_context_unload_module(
+        server->ctx,
+        vloopback->module_idx.get_future().get(),
+        [](pa_context *c, int status, void *data) {
+          logs::log(logs::debug, "[PULSE] Removed loopback, status: {}", status);
+        },
+        nullptr);
+    pa_operation_unref(operation);
+  });
+}
+
+void set_default_source(const std::shared_ptr<Server> &server, std::string_view source_name) {
+  queue_op(server, [server, source = std::string(source_name)]() {
+    logs::log(logs::debug, "[PULSE] Setting default source to {}", source);
+    auto operation = pa_context_set_default_source(server->ctx, source.c_str(), nullptr, nullptr);
+    if (operation) {
+      pa_operation_unref(operation);
+    }
   });
 }
 
