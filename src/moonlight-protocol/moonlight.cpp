@@ -32,6 +32,14 @@ XML serverinfo(bool isServerBusy,
   resp.put("root.GfeVersion", M_GFE_VERSION);
   resp.put("root.uniqueid", uuid);
 
+  // Advertise the Foundation Sunshine microphone extension.
+  // moonlight-common (and therefore Moonlight clients) only enables the microphone
+  // stream when it detects a "Foundation" server, which it does by the presence of
+  // <SunshineVersion> (or <appListEtag>) in this response. Wolf implements the
+  // Foundation mic protocol (RTSP streamid=mic + RTP Opus to a virtual microphone),
+  // so we advertise it here.
+  resp.put("root.SunshineVersion", "wolf");
+
   int codec_support = VIDEO_FORMAT_H264;
   int max_luma_pixels = 0;
   if (support_hevc) {
