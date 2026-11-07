@@ -14,6 +14,8 @@
 
 struct pa_context;
 struct pa_sink_input_info;
+struct pa_source_info;
+struct pa_source_output_info;
 
 namespace wolf::core::audio {
 
@@ -32,6 +34,9 @@ struct PulseAudioRouterState {
   // session_id -> sink_index (from VirtualAudioSinkCreated)
   immer::atom<immer::map<std::string, uint32_t>> session_to_sink_idx{immer::map<std::string, uint32_t>{}};
 
+  // session_id -> monitor source index of `virtual_mic_<session>`
+  immer::atom<immer::map<std::string, uint32_t>> session_to_mic_source_idx{immer::map<std::string, uint32_t>{}};
+
   // Pulse subscribe / callbacks
   void enable_pulse_subscribe();
   void rescan();
@@ -39,11 +44,14 @@ struct PulseAudioRouterState {
   static void pa_subscribe_cb(pa_context *c, pa_subscription_event_type_t t, uint32_t idx, void *userdata);
   static void pa_sink_input_info_cb(pa_context *c, const pa_sink_input_info *info, int eol, void *userdata);
   static void pa_sink_info_cb(pa_context *c, const pa_sink_info *info, int eol, void *userdata);
+  static void pa_source_info_cb(pa_context *c, const pa_source_info *info, int eol, void *userdata);
+  static void pa_source_output_info_cb(pa_context *c, const pa_source_output_info *info, int eol, void *userdata);
 
   void on_container_created(const events::DockerContainerCreated &ev);
   void on_container_stopped(const events::DockerContainerStopped &ev);
 
   void route_sink_input_(pa_context *c, const pa_sink_input_info *info);
+  void route_source_output_(pa_context *c, const pa_source_output_info *info);
 };
 
 /**

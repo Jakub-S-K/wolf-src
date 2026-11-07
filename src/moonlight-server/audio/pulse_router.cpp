@@ -10,6 +10,7 @@
 
 #include <utility>
 
+using wolf::core::sessions::VIRTUAL_MIC_PREFIX;
 using wolf::core::sessions::VIRTUAL_SINK_PREFIX;
 
 namespace wolf::core::audio {
@@ -65,6 +66,9 @@ void PulseAudioRouterState::rescan() {
     auto op = pa_context_get_sink_input_info_list(c, &PulseAudioRouterState::pa_sink_input_info_cb, this);
     if (op)
       pa_operation_unref(op);
+    auto op_so = pa_context_get_source_output_info_list(c, &PulseAudioRouterState::pa_source_output_info_cb, this);
+    if (op_so)
+      pa_operation_unref(op_so);
   });
 }
 
@@ -152,7 +156,8 @@ void PulseAudioRouterState::enable_pulse_subscribe() {
 
     auto op = pa_context_subscribe(
         c,
-        static_cast<pa_subscription_mask_t>(PA_SUBSCRIPTION_MASK_SINK_INPUT | PA_SUBSCRIPTION_MASK_SINK),
+        static_cast<pa_subscription_mask_t>(PA_SUBSCRIPTION_MASK_SINK_INPUT | PA_SUBSCRIPTION_MASK_SINK |
+                                            PA_SUBSCRIPTION_MASK_SOURCE_OUTPUT | PA_SUBSCRIPTION_MASK_SOURCE),
         nullptr,
         nullptr);
     if (op)
@@ -167,7 +172,15 @@ void PulseAudioRouterState::enable_pulse_subscribe() {
     if (op3)
       pa_operation_unref(op3);
 
-    logs::log(logs::debug, "[PULSE_ROUTER] Enabled PulseAudio subscription (sink-input + sink)");
+    auto op4 = pa_context_get_source_info_list(c, &PulseAudioRouterState::pa_source_info_cb, this);
+    if (op4)
+      pa_operation_unref(op4);
+
+    auto op5 = pa_context_get_source_output_info_list(c, &PulseAudioRouterState::pa_source_output_info_cb, this);
+    if (op5)
+      pa_operation_unref(op5);
+
+    logs::log(logs::debug, "[PULSE_ROUTER] Enabled PulseAudio subscription (sink-input + sink + source + source-output)");
   });
 }
 
@@ -199,6 +212,24 @@ void PulseAudioRouterState::pa_subscribe_cb(pa_context *c,
     }
     return;
   }
+
+  if (facility == PA_SUBSCRIPTION_EVENT_SOURCE_OUTPUT) {
+    if (type == PA_SUBSCRIPTION_EVENT_NEW || type == PA_SUBSCRIPTION_EVENT_CHANGE) {
+      auto op = pa_context_get_source_output_info(c, idx, &PulseAudioRouterState::pa_source_output_info_cb, userdata);
+      if (op)
+        pa_operation_unref(op);
+    }
+    return;
+  }
+
+  if (facility == PA_SUBSCRIPTION_EVENT_SOURCE) {
+    if (type == PA_SUBSCRIPTION_EVENT_NEW || type == PA_SUBSCRIPTION_EVENT_CHANGE) {
+      auto op = pa_context_get_source_info_by_index(c, idx, &PulseAudioRouterState::pa_source_info_cb, userdata);
+      if (op)
+        pa_operation_unref(op);
+    }
+    return;
+  }
 }
 
 void PulseAudioRouterState::pa_sink_input_info_cb(pa_context *c,
@@ -212,6 +243,91 @@ void PulseAudioRouterState::pa_sink_input_info_cb(pa_context *c,
     return;
 
   self->route_sink_input_(c, info);
+}
+
+void PulseAudioRouterState::pa_source_info_cb(pa_context * /*c*/, const pa_source_info *info, int eol, void *userdata) {
+  if (eol != 0 || !info || !info->name)
+    return;
+  auto *self = static_cast<PulseAudioRouterState *>(userdata);
+  if (!self)
+    return;
+
+  std::string_view name{info->name};
+  constexpr std::string_view monitor_suffix = ".monitor";
+  if (!name.starts_with(VIRTUAL_MIC_PREFIX) || !name.ends_with(monitor_suffix))
+    return;
+
+  auto rest = name.substr(VIRTUAL_MIC_PREFIX.size());
+  std::string session_id(rest.substr(0, rest.size() - monitor_suffix.size()));
+
+  self->session_to_mic_source_idx.update([&](auto m) { return m.set(session_id, info->index); });
+  logs::log(logs::debug,
+            "[PULSE_ROUTER] Mic source appeared name='{}' idx={} -> session='{}'",
+            info->name,
+            info->index,
+            session_id);
+
+  // Route any recording stream that was waiting for this monitor.
+  self->rescan();
+}
+
+void PulseAudioRouterState::pa_source_output_info_cb(pa_context *c,
+                                                     const pa_source_output_info *info,
+                                                     int eol,
+                                                     void *userdata) {
+  if (eol || !info)
+    return;
+  auto *self = static_cast<PulseAudioRouterState *>(userdata);
+  if (!self)
+    return;
+
+  self->route_source_output_(c, info);
+}
+
+void PulseAudioRouterState::route_source_output_(pa_context *c, const pa_source_output_info *info) {
+  if (!info || !info->proplist)
+    return;
+
+  const char *host = pa_proplist_gets(info->proplist, "application.process.host");
+  if (!host || host[0] == '\0')
+    return;
+
+  // host -> session_id
+  std::optional<std::string> session_id;
+  {
+    auto box = host_to_session.load();
+    const auto &m = *box;
+    if (auto v = m.find(std::string(host)))
+      session_id = *v;
+  }
+  if (!session_id || session_id->empty())
+    return;
+
+  // session_id -> monitor source index of that session's virtual microphone
+  std::optional<uint32_t> target_source_idx;
+  {
+    auto box = session_to_mic_source_idx.load();
+    const auto &m = *box;
+    if (auto v = m.find(*session_id))
+      target_source_idx = *v;
+  }
+  if (!target_source_idx)
+    return;
+
+  // Already recording from the right microphone
+  if (info->source == *target_source_idx)
+    return;
+
+  auto op = pa_context_move_source_output_by_index(c, info->index, *target_source_idx, nullptr, nullptr);
+  if (op)
+    pa_operation_unref(op);
+
+  logs::log(logs::debug,
+            "[PULSE_ROUTER] Move source-output={} host='{}' -> session='{}' mic_source_idx={}",
+            info->index,
+            host,
+            *session_id,
+            *target_source_idx);
 }
 
 void PulseAudioRouterState::route_sink_input_(pa_context *c, const pa_sink_input_info *info) {

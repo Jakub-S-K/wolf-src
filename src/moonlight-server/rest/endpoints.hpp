@@ -392,6 +392,7 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
                                             get_header(headers, "rikeyid").value());
 
   base_session->ip = client_ip;
+  base_session->client_unique_id = get_header(headers, "uniqueid").value_or("");
   return std::move(base_session);
 }
 
@@ -458,6 +459,18 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
     new_session->joypads = std::move(old_session->joypads);
     new_session->pen_tablet = std::move(old_session->pen_tablet);
     new_session->touch_screen = std::move(old_session->touch_screen);
+
+    // Reuse the microphone socket the live microphone receiver is reading from.
+    // `create_run_session` opens a fresh mic socket for every session (including resumes);
+    // without this the RTSP mic SETUP would hand out a port nobody reads, so the client's
+    // microphone audio would be silently dropped. We intentionally do not carry over the
+    // VSink handles (they may already have been consumed by the previous runner's cleanup).
+    new_session->mic_socket_fd = std::move(old_session->mic_socket_fd);
+    new_session->mic_stream_port = old_session->mic_stream_port;
+    logs::log(logs::debug,
+              "[HTTP] Resuming session {}, keeping microphone socket on port {}",
+              new_session->session_id,
+              new_session->mic_stream_port);
 
     state->running_sessions->update([&old_session, new_session](const immer::vector<events::StreamSession> ses_v) {
       return state::remove_session(ses_v, old_session.value()).push_back(*new_session);

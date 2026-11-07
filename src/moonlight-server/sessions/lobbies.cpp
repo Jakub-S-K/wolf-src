@@ -58,6 +58,11 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
       events::SwitchStreamProducerEvents{.session_id = session.session_id,
                                          .interpipe_src_id = std::to_string(session.session_id)}});
 
+  // Redirect the client microphone back to the session virtual microphone
+  ev_bus->fire_event(immer::box<events::SwitchMicSinkEvent>{
+      events::SwitchMicSinkEvent{.session_id = session.session_id,
+                                 .sink_name = fmt::format("{}{}", VIRTUAL_MIC_PREFIX, session.session_id)}});
+
   if (lobby.stop_when_everyone_leaves && lobby.connected_sessions->load()->size() == 0) {
     // Nobody left in the lobby, and it's set to stop when everyone leaves
     ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby.id}});
@@ -139,6 +144,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                      .wayland_display = lobby->wayland_display->load(),
                                      .audio_server = audio_server,
                                      .audio_sink = lobby->audio_sink->load(),
+                                     .mic_sink = lobby->mic_sink->load(),
                                      .host = host,
                                      .app_local_state_folder = full_path.string(),
                                      .app_host_state_folder = std::filesystem::path(host->host_base_state_folder) /
@@ -177,6 +183,19 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                               sink_name,
                                               audio::get_server_name(audio_server));
             }).detach();
+          }
+        }
+
+        { // Create virtual microphone sink (Foundation mic extension)
+          if (audio_server && audio_server->server) {
+            logs::log(logs::debug, "[LOBBY] Create virtual microphone sink");
+            auto mic_sink_name = fmt::format("{}{}", VIRTUAL_MIC_PREFIX, lobby->id);
+            auto mic_device = audio::create_virtual_sink(
+                audio_server->server,
+                audio::AudioDevice{.sink_name = mic_sink_name,
+                                   .mode = state::get_audio_mode(2, true),
+                                   .description = "WolfMicrophone"});
+            lobby->mic_sink->store(mic_device);
           }
         }
       }));
@@ -241,6 +260,11 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         // Switch audio/video gstreamer stream producers
         app_state->event_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>{
             events::SwitchStreamProducerEvents{.session_id = session->session_id, .interpipe_src_id = lobby->id}});
+
+        // Redirect the client microphone into the lobby virtual microphone
+        app_state->event_bus->fire_event(immer::box<events::SwitchMicSinkEvent>{
+            events::SwitchMicSinkEvent{.session_id = session->session_id,
+                                       .sink_name = fmt::format("{}{}", VIRTUAL_MIC_PREFIX, lobby->id)}});
         join_lobby_event->error_message.get()->set_value("");
       }));
 
@@ -278,6 +302,17 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         for (auto &session_id : sessions) {
           app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
               events::LeaveLobbyEvent{.lobby_id = lobby->id, .moonlight_session_id = std::stoul(*session_id)}});
+        }
+
+        // Release the lobby's virtual microphone: it belongs to the lobby (not to a session's
+        // microphone receiver), and `start_runner` no longer deletes it so that a paused session's
+        // receiver keeps its device. Without this the sink would leak for every ended lobby.
+        if (audio_server && audio_server->server) {
+          std::shared_ptr<audio::VSink> lobby_mic = lobby->mic_sink->load();
+          if (lobby_mic) {
+            logs::log(logs::debug, "[LOBBY] Removing virtual microphone sink for lobby {}", lobby->id);
+            audio::delete_virtual_sink(audio_server->server, lobby_mic);
+          }
         }
 
         // Finally, remove the lobby from the app_state
